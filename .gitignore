@@ -1,0 +1,29 @@
+# Compiled binaries
+scripts/pdf_healer
+*.o
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+
+# Temporary test outputs & previews
+temp/
+tmp/
+*.tmp
+*.log
+preview_mask.png
+*_clean.pdf
+*_cleaned.pdf
