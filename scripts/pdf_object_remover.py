@@ -12,10 +12,13 @@ Part of the pdf-object-remover skill on macOS.
    - Inserts a visible, editable rectangle annotation on the detected spot in Preview.app.
    - Allows moving, resizing, or drawing custom mask objects directly in Preview.app.
    - Detects the adjusted annotation in Preview.app and uses it as the mask.
-3. Configurable scope:
+3. Live Preview.app Reloading:
+   - Automatically reloads the document live in Preview.app so changes appear on screen immediately.
+   - In-place healing (--in-place) with automatic backup.
+4. Configurable scope:
    - Apply healing across ALL pages at matching relative position (default).
    - Or apply healing ONLY to that specific page (--scope single / --scope page).
-4. Executes page-adaptive healing on every page individually (matching each
+5. Executes page-adaptive healing on every page individually (matching each
    page's unique 2D gradient, grain noise, solid fill, or architectural grid).
 """
 
@@ -164,8 +167,26 @@ def stage_preview_document(
 def open_in_preview_app(pdf_path: str):
     """Opens a PDF in macOS Preview.app and brings Preview to the foreground."""
     subprocess.run(["open", "-a", "Preview", os.path.abspath(pdf_path)])
-    # Activate Preview
     subprocess.run(["osascript", "-e", 'tell application "Preview" to activate'], capture_output=True)
+
+
+def reload_in_preview_app(pdf_path: str):
+    """Reloads the specified PDF in Preview.app live via AppleScript."""
+    abs_path = os.path.abspath(pdf_path)
+    script = f'''
+    tell application "Preview"
+        activate
+        set targetPath to "{abs_path}"
+        repeat with d in documents
+            if (path of d as text) is equal to targetPath then
+                close d saving no
+                exit repeat
+            end if
+        end repeat
+        open POSIX file targetPath
+    end tell
+    '''
+    subprocess.run(["osascript", "-e", script], capture_output=True)
 
 
 def process_with_native_engine(
@@ -267,7 +288,6 @@ def process_with_exemplar_engine(
     import numpy as np
     from PIL import Image
 
-    # Try importing fitz or fallback to Swift page extractor
     try:
         import fitz
         HAS_FITZ = True
@@ -308,7 +328,6 @@ def process_with_exemplar_engine(
         total_pages = len(doc)
         print(f"📄 Processing {total_pages} page(s) via PyMuPDF + Exemplar/Neural Engine ({strategy.upper()})...")
 
-        # Parse target pages according to scope
         if scope in ["single", "page", "current"]:
             target_set = {anchor_page - 1}
         elif pages.lower() == "all":
@@ -350,7 +369,6 @@ def process_with_exemplar_engine(
                 cv2.imwrite(out_page_path, img_bgr)
                 page_images.append(out_page_path)
 
-        # Assemble new PDF
         out_doc = fitz.open()
         for p_path in page_images:
             img_doc = fitz.open(p_path)
@@ -366,7 +384,6 @@ def process_with_exemplar_engine(
         print(f"✅ Successfully created cleaned PDF: {output_pdf}")
         return True
     else:
-        # Fallback to native engine with auto mode if PyMuPDF not available
         print("Notice: PyMuPDF not found, delegating to native Apple Silicon engine...")
         return process_with_native_engine(
             input_pdf=input_pdf,
@@ -419,6 +436,7 @@ def run_preview_interactive_flow(
     5. Detects the updated annotation bounds from Preview.app.
     6. Prompts for scope (all pages vs only anchor page) if not preset.
     7. Heals the PDF and saves clean output.
+    8. Automatically reloads the document live in Preview.app.
     """
     print(f"\n🔍 Step 1: Detecting target spot on Anchor Page {anchor_page}...")
     initial_res = inspect_anchor_page(
@@ -481,7 +499,6 @@ def run_preview_interactive_flow(
     print("   4. When satisfied with the mask area, press Cmd+S to SAVE in Preview.app.")
     print("=" * 70)
 
-    # Prompt user in terminal
     try:
         user_input = input("\n👉 Press [ENTER] after saving in Preview.app (or type 'q' to abort): ").strip()
     except (EOFError, KeyboardInterrupt):
@@ -513,10 +530,8 @@ def run_preview_interactive_flow(
     if detected_from_annot:
         print(f"  [✓] Successfully extracted {annot_type} object from Preview.app!")
 
-    # Format explicit box string for processing
     explicit_box_str = f"{updated_norm[0]:.6f},{updated_norm[1]:.6f},{updated_norm[2]:.6f},{updated_norm[3]:.6f}"
 
-    # Prompt for scope if scope was not explicitly provided on CLI
     chosen_scope = scope
     if scope == "ask" or (sys.stdin.isatty() and scope == "all"):
         print("\n❓ Step 5: Choose Healing Scope:")
@@ -576,6 +591,10 @@ def run_preview_interactive_flow(
             preview_mask_path=preview_mask_path,
         )
 
+    if success:
+        print(f"✨ Live reloading healed document in Preview.app...")
+        reload_in_preview_app(output_pdf)
+
     shutil.rmtree(temp_dir, ignore_errors=True)
     return success
 
@@ -586,6 +605,8 @@ def main():
     )
     parser.add_argument("--input", "-i", required=True, help="Input PDF document path")
     parser.add_argument("--output", "-o", help="Output cleaned PDF document path")
+    parser.add_argument("--in-place", action="store_true", help="Update input PDF document directly in-place (with backup)")
+    parser.add_argument("--reload-preview", action="store_true", help="Reload output document live in Preview.app after healing")
     parser.add_argument("--anchor-page", "-p", type=int, default=1, help="Anchor reference page for detection (default: 1)")
     parser.add_argument("--filter", "-f", "--query", "-q", help="OCR text query or substring to detect on anchor page")
     parser.add_argument(
@@ -648,6 +669,12 @@ def main():
     parser.add_argument("--json", action="store_true", help="Output inspection or stats in structured JSON format")
 
     args = parser.parse_args()
+
+    # Handle In-place Output
+    if args.in_place:
+        if not args.output:
+            args.output = args.input
+            args.reload_preview = True
 
     # Stage preview only
     if args.stage_preview:
@@ -715,13 +742,24 @@ def main():
         return
 
     if not args.output:
-        print("Error: --output PDF path is required (unless using --inspect or --stage-preview).", file=sys.stderr)
+        print("Error: --output PDF path is required (unless using --inspect, --stage-preview, or --in-place).", file=sys.stderr)
         sys.exit(1)
+
+    # In-place backup
+    if os.path.abspath(args.input) == os.path.abspath(args.output):
+        backup_path = args.input + ".backup.pdf"
+        shutil.copyfile(args.input, backup_path)
+        temp_out = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
+        target_final_out = args.output
+        args.output = temp_out
+        is_in_place = True
+    else:
+        is_in_place = False
+        target_final_out = args.output
 
     # Check for Interactive / Preview.app flow
     should_open_preview = args.preview_app
     if args.interactive and not args.preview_app:
-        # Prompt user whether to open in Preview.app
         try:
             ans = input(f"❓ Would you like to open '{Path(args.input).name}' in Preview.app to visually adjust the target rectangle? [y/N]: ").strip().lower()
             if ans in ["y", "yes"]:
@@ -752,56 +790,61 @@ def main():
             min_y=args.min_y,
             max_y=args.max_y,
         )
-        if not success:
-            sys.exit(1)
-        return
-
-    # Direct Processing Flow
-    if args.mode in ["exemplar", "lama", "composite"]:
-        success = process_with_exemplar_engine(
-            input_pdf=args.input,
-            output_pdf=args.output,
-            anchor_page=args.anchor_page,
-            zone=args.zone,
-            text_filter=args.filter,
-            explicit_box=args.box,
-            from_annotation=args.from_annotation,
-            strategy=args.mode,
-            dpi=args.dpi,
-            pages=args.pages,
-            exclude_pages=args.exclude_pages,
-            scope=args.scope,
-            padding=args.padding,
-            seam_width=args.feather,
-            extend_right=args.extend_right,
-            extend_bottom=args.extend_bottom,
-            preview_mask_path=args.preview_mask,
-        )
     else:
-        success = process_with_native_engine(
-            input_pdf=args.input,
-            output_pdf=args.output,
-            anchor_page=args.anchor_page,
-            zone=args.zone,
-            text_filter=args.filter,
-            explicit_box=args.box,
-            from_annotation=args.from_annotation,
-            mode=args.mode,
-            dpi=args.dpi,
-            pages=args.pages,
-            exclude_pages=args.exclude_pages,
-            scope=args.scope,
-            padding=args.padding,
-            feather=args.feather,
-            extend_right=args.extend_right,
-            extend_bottom=args.extend_bottom,
-            preview_mask_path=args.preview_mask,
-            min_x=args.min_x,
-            max_x=args.max_x,
-            min_y=args.min_y,
-            max_y=args.max_y,
-            json_output=args.json,
-        )
+        # Direct Processing Flow
+        if args.mode in ["exemplar", "lama", "composite"]:
+            success = process_with_exemplar_engine(
+                input_pdf=args.input,
+                output_pdf=args.output,
+                anchor_page=args.anchor_page,
+                zone=args.zone,
+                text_filter=args.filter,
+                explicit_box=args.box,
+                from_annotation=args.from_annotation,
+                strategy=args.mode,
+                dpi=args.dpi,
+                pages=args.pages,
+                exclude_pages=args.exclude_pages,
+                scope=args.scope,
+                padding=args.padding,
+                seam_width=args.feather,
+                extend_right=args.extend_right,
+                extend_bottom=args.extend_bottom,
+                preview_mask_path=args.preview_mask,
+            )
+        else:
+            success = process_with_native_engine(
+                input_pdf=args.input,
+                output_pdf=args.output,
+                anchor_page=args.anchor_page,
+                zone=args.zone,
+                text_filter=args.filter,
+                explicit_box=args.box,
+                from_annotation=args.from_annotation,
+                mode=args.mode,
+                dpi=args.dpi,
+                pages=args.pages,
+                exclude_pages=args.exclude_pages,
+                scope=args.scope,
+                padding=args.padding,
+                feather=args.feather,
+                extend_right=args.extend_right,
+                extend_bottom=args.extend_bottom,
+                preview_mask_path=args.preview_mask,
+                min_x=args.min_x,
+                max_x=args.max_x,
+                min_y=args.min_y,
+                max_y=args.max_y,
+                json_output=args.json,
+            )
+
+    if is_in_place and success:
+        shutil.move(args.output, target_final_out)
+        args.output = target_final_out
+
+    if success and args.reload_preview:
+        print(f"✨ Live reloading '{Path(args.output).name}' in Preview.app...")
+        reload_in_preview_app(args.output)
 
     if not success:
         sys.exit(1)
