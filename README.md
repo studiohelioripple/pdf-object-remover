@@ -8,9 +8,9 @@
 [![Metal GPU](https://img.shields.io/badge/Metal-Hardware%20Accelerated-blue.svg)](https://developer.apple.com/metal/)
 [![Vision OCR](https://img.shields.io/badge/Apple%20Vision-VNRecognizeTextRequest-purple.svg)](https://developer.apple.com/documentation/vision)
 
-A multi-page PDF presentation, slide deck, and document healing suite for macOS.
+A multi-page PDF presentation, slide deck, and document healing suite for macOS with native **macOS Preview.app Visual Interactive Masking**.
 
-Addresses a recurring watermark, badge, counter, stamp, or label on a single **Anchor Page** (via Apple Vision OCR or spatial quadrants), normalizes the bounding area, and **heals all slides/pages at that matching position**, adapting page-by-page to each slide's individual background color, 2D gradient, grain noise, or drafting grid.
+Addresses a recurring watermark, badge, counter, stamp, or label on a single **Anchor Page** (via Apple Vision OCR, spatial quadrants, or direct Preview.app markup shapes), normalizes the bounding area, and **heals all slides/pages (or selected single pages) at that matching position**, adapting page-by-page to each slide's individual background color, 2D gradient, grain noise, or drafting grid.
 
 ---
 
@@ -26,9 +26,9 @@ When cleaning multi-page PDFs (such as keynote presentations, client decks, arch
 
 Blindly pasting a solid white box or generic rectangle destroys dark slides and ruins textured drawings. Conversely, manually selecting coordinates on every single slide is impossibly slow.
 
-**`pdf-object-remover` solves this with a two-phase architecture**:
-1. **Targeting on Anchor Page**: Locate the object once on an anchor slide (by OCR text matching, quadrant zone, or coordinates) and extract resolution-independent normalized bounds `(normX, normY, normW, normH)`.
-2. **Slide-Adaptive In-Place Healing**: Scale the target bounding box across all pages, sampling local boundary pixels on **each individual slide** to synthesize matching 2D gradients, grain noise, flat fills, or phase-aligned donor grid patches.
+**`pdf-object-remover` solves this with an interactive two-phase architecture**:
+1. **Targeting on Anchor Page**: Locate the object once on an anchor slide (by OCR text matching, quadrant zone, coordinates, or **visually in Preview.app**) and extract resolution-independent normalized bounds `(normX, normY, normW, normH)`.
+2. **Slide-Adaptive In-Place Healing**: Scale the target bounding box across all pages (or strictly the target page), sampling local boundary pixels on **each individual slide** to synthesize matching 2D gradients, grain noise, flat fills, or phase-aligned donor grid patches.
 
 ---
 
@@ -36,22 +36,27 @@ Blindly pasting a solid white box or generic rectangle destroys dark slides and 
 
 ```mermaid
 flowchart TD
-    subgraph Phase1["Phase 1: Anchor Page Detection & Normalization"]
+    subgraph Phase1["Phase 1: Anchor Page Detection & Preview.app Interaction"]
         A["Input PDF (e.g. 50 Pages)"] --> B["Anchor Page Selection (--anchor-page 1)"]
         B --> C["Render Page at Target DPI (Apple CoreGraphics/PDFKit)"]
         C --> D{"Object Targeting Method"}
         D -->|OCR Text Filter| E1["Apple Vision OCR (VNRecognizeTextRequest)"]
         D -->|Spatial Quadrant| E2["Zone Presets (bottom-right, footer, logo)"]
         D -->|Explicit Box| E3["User Coordinates (px or normalized 0..1)"]
+        D -->|Preview.app Interactive| E4["Insert Rectangle Annotation & Open Preview.app"]
         E1 --> F["Tight Bounding Box Synthesis (+ Padding/Edge Extension)"]
         E2 --> F
         E3 --> F
+        E4 -->|User Moves/Resizes Shape in Preview.app| F
         F --> G["Normalized Coordinates: (normX, normY, normW, normH)"]
         F -.-> Preview["Diagnostic Preview Mask Overlay (preview_mask.png)"]
     end
 
-    subgraph Phase2["Phase 2: Cross-Page Slide-Adaptive Healing"]
-        G --> H["Iterate Target PDF Pages (0 .. N-1)"]
+    subgraph Phase2["Phase 2: Cross-Page Slide-Adaptive Healing & Scoping"]
+        G --> Scope{"Healing Scope (--scope all vs single)"}
+        Scope -->|All Pages| H["Iterate Target PDF Pages (0 .. N-1)"]
+        Scope -->|Single Page| HSingle["Target Anchor Page Only"]
+        HSingle --> I
         H --> I["Render Page i at High Resolution (CoreGraphics)"]
         I --> J["Compute Pixel Box: norm * (width_i, height_i)"]
         J --> K["Perimeter Background Sampling (14px Margin Ring)"]
@@ -64,7 +69,7 @@ flowchart TD
         M2 --> N
         M3 --> N
         M4 --> N
-        N --> O["Healed Page i Reconstructed into PDFDocument"]
+        N --> O["Healed Page i Reconstructed into PDFDocument (Annotations Stripped)"]
     end
 
     O --> P["Final Cleaned Multi-Page PDF Document"]
@@ -74,10 +79,18 @@ flowchart TD
 
 ## ✨ Key Capabilities
 
-- 🎯 **Anchor Page Addressing**:
+- 📱 **Interactive Preview.app Workflow (`--open-preview` / `-P` / `--interactive` / `-I`)**:
+  - Automatically inserts an editable native PDF rectangle annotation (`PDFAnnotationSubtypeSquare`) over the detected spot and opens the staged document directly in **Preview.app**.
+  - Allows you to move, resize, or draw your own shapes (rectangles, highlights, circles, redaction boxes) in Preview.app using its native Markup Toolbar (`Cmd+Shift+A`).
+  - Detects the updated/drawn masking object directly from Preview.app (`--from-annotation`) upon saving (`Cmd+S`).
+- 🎯 **Flexible Anchor Page Addressing**:
   - **OCR Text Filter / Query**: `--filter "CONFIDENTIAL"` or `--query "DRAFT"` automatically finds and bounds the text using Apple Vision.
   - **Spatial Quadrant Presets**: `--zone bottom-right`, `bottom-right-corner`, `footer`, `header`, `logo`, `bottom-left`, `top-right`, `top-left`, `all`, or `custom`.
   - **Explicit Bounding Box**: `--box "x,y,w,h"` (supports either normalized `0.0..1.0` or pixel coordinates).
+- 🎛️ **Configurable Healing Scope (`--scope all` vs `--scope single`)**:
+  - **All Pages (`--scope all`, Default)**: Normalizes mask coordinates and heals all pages across the PDF at that matching relative position.
+  - **Single Page (`--scope single` / `--scope page`)**: Heals strictly the anchor page where the mask was addressed, leaving other pages untouched.
+  - **Custom Range (`--pages "1-5,8"`)**: Selective subset healing.
 - 📐 **Resolution-Independent Normalization**: Normalized coordinate mapping ensures flawless alignment across mixed aspect ratios (e.g., landscape slides alongside portrait appendices).
 - 🎨 **Page-Adaptive Healing Strategies (from `keynote-tools`)**:
   - **`auto`** *(Default)*: Automatically measures local perimeter variance on each page. Applies 2D planar gradient equations if variance is high, or solid median fill if flat, plus synthetic noise grain.
@@ -85,9 +98,7 @@ flowchart TD
   - **`solid`**: Rapid dominant color fill with distance-transform edge feathering.
   - **`exemplar`**: 2D normalized cross-correlation (`cv2.matchTemplate`) donor patch transfer for architectural drafting paper, blueprint grids, and repeating dot matrices.
   - **`lama` / `composite`**: Big-LaMa neural inpainting running on Apple Silicon GPU (`mps`) with a 6px perimeter seam feathering ramp.
-- 📸 **Diagnostic Visual Verification**:
-  - `--inspect`: Prints the exact normalized and pixel coordinates along with recognized text without modifying the PDF.
-  - `--preview-mask mask.png`: Saves an image of the anchor page with the detected bounding box highlighted in semi-transparent red with a green border.
+- 🧹 **Zero-Leftover Annotation Stripping**: Automatically strips temporary markup boxes and staging annotations before writing the final output PDF.
 - ⚡ **Native Apple Silicon Speed**: Built with Swift, `PDFKit`, `CoreGraphics`, `Vision`, and `CoreImage` for sub-second vector rendering and PDF reconstruction.
 
 ---
@@ -98,7 +109,7 @@ Installed in `~/.local/bin` and `~/bin`:
 
 | Command | Type | Description |
 |---|---|---|
-| [`pdf-object-remover`](scripts/pdf_object_remover.py) | Python CLI | Master CLI orchestrator handling detection, preview masks, and dispatching. |
+| [`pdf-object-remover`](scripts/pdf_object_remover.py) | Python CLI | Master CLI orchestrator handling detection, Preview.app staging, and dispatching. |
 | `pdf-remover` | Alias | Quick command alias for `pdf-object-remover`. |
 | [`pdf_healer`](scripts/pdf_healer) | Native Binary | Compiled Swift executable (`CoreGraphics`, `Vision`, `CoreImage`, `PDFKit`). |
 | [`exemplar_healer.py`](scripts/exemplar_healer.py) | Python 3 | 2D cross-correlation donor patch matcher and Big-LaMa neural seam healer. |
@@ -109,8 +120,6 @@ Installed in `~/.local/bin` and `~/bin`:
 ## 🚀 Installation
 
 ### Option 1: Install as Antigravity / Gemini AI Agent Skill (Recommended)
-
-To install this skill for AI agent pairing in Antigravity or Gemini CLI:
 
 ```bash
 # Clone directly into your skills directory
@@ -139,16 +148,48 @@ pip install -r requirements.txt
 
 Make sure `~/.local/bin` (or `~/bin`) is in your shell's `$PATH`.
 
-### Prerequisites
-- macOS 13+ (Ventura, Sonoma, Sequoia - Apple Silicon M1/M2/M3/M4 or Intel)
-- Xcode Command Line Tools (`swiftc`): `xcode-select --install`
-- Python 3.9+ with `pip`
-
 ---
 
 ## 📖 Practical Usage Recipes
 
-### 1. Non-Destructive Inspection & Diagnostic Mask Preview
+### 1. Visual Interactive Masking with Preview.app
+Opens the document in Preview.app with the target area highlighted by a red rectangle. Adjust the rectangle handles in Preview.app, press `Cmd+S`, and hit Enter in the terminal to heal all pages:
+```bash
+pdf-object-remover \
+  --input presentation.pdf \
+  --output presentation_clean.pdf \
+  --anchor-page 1 \
+  --filter "CONFIDENTIAL" \
+  --open-preview
+```
+
+---
+
+### 2. Interactive Prompt Workflow
+Asks interactively if you'd like to open Preview.app, and prompts you to choose between healing all pages or only the current page:
+```bash
+pdf-object-remover \
+  --input deck.pdf \
+  --output deck_clean.pdf \
+  --interactive
+```
+
+---
+
+### 3. Heal Only That Specific Page (`--scope single`)
+Detect or address an object on Page 2 and heal **only Page 2**, leaving the rest of the document intact:
+```bash
+pdf-object-remover \
+  --input blueprints.pdf \
+  --output blueprints_clean.pdf \
+  --anchor-page 2 \
+  --from-annotation \
+  --scope single
+```
+
+---
+
+### 4. Non-Destructive Inspection & Diagnostic Mask Preview
 Verify exactly what object will be removed before touching your presentation:
 ```bash
 pdf-object-remover \
@@ -159,19 +200,9 @@ pdf-object-remover \
   --inspect
 ```
 
-Output:
-```
-🎯 Anchor Page 1 Object Detection Summary:
-  • Normalized Area: [x: 0.7635, y: 0.9078, w: 0.1619, h: 0.0296]
-  • Pixel Area (300 DPI): 3054,2042 647x66 px
-  • Matched Text: CONFIDENTIAL DRAFT
-  • Background: #1F388C (Gradient: False)
-  • Preview Mask: preview_mask.png
-```
-
 ---
 
-### 2. Auto-Adaptive Cross-Slide Watermark Erase
+### 5. Auto-Adaptive Cross-Slide Watermark Erase
 Detects `"DRAFT"` on Page 1 and heals all slides, automatically adapting to each slide's individual color/gradient:
 ```bash
 pdf-object-remover \
@@ -185,7 +216,7 @@ pdf-object-remover \
 
 ---
 
-### 3. Corner Stamp or Logo Removal (Flush to Page Boundary)
+### 6. Corner Stamp or Logo Removal (Flush to Page Boundary)
 Removes a corner stamp and extends flush to the canvas edge to avoid hairline remnants:
 ```bash
 pdf-object-remover \
@@ -200,7 +231,7 @@ pdf-object-remover \
 
 ---
 
-### 4. Remove Header or Footer Notice Bar Across All Slides
+### 7. Remove Header or Footer Notice Bar Across All Slides
 Erases a full-width footer disclaimer across the entire presentation:
 ```bash
 pdf-object-remover \
@@ -213,7 +244,7 @@ pdf-object-remover \
 
 ---
 
-### 5. Architectural Blueprint / Grid Slide Healing (`exemplar`)
+### 8. Architectural Blueprint / Grid Slide Healing (`exemplar`)
 For blueprint sets, structural drawings, or drafting paper slides where removing a watermark requires matching repeating grid lines:
 ```bash
 pdf-object-remover \
@@ -227,26 +258,18 @@ pdf-object-remover \
 
 ---
 
-### 6. Selective Page Range Processing
-Heal only slides 2 through 15, leaving the title slide untouched:
-```bash
-pdf-object-remover \
-  --input deck.pdf \
-  --output deck_clean.pdf \
-  --anchor-page 2 \
-  --filter "INTERNAL ONLY" \
-  --pages "2-15"
-```
-
----
-
 ## ⚙️ CLI Flag Reference
 
 | Flag | Shortcut | Default | Description |
 |---|---|---|---|
 | `--input` | `-i` | *Required* | Path to input PDF document |
-| `--output` | `-o` | *Required* (unless `--inspect`) | Path to output cleaned PDF document |
+| `--output` | `-o` | *Required* (unless `--inspect` or `--stage-preview`) | Path to output cleaned PDF document |
 | `--anchor-page` | `-p` | `1` | Reference page (1-based index) to detect target object on |
+| `--open-preview` / `--preview-app` | `-P` | `false` | Stage rectangle annotation and open in **Preview.app** for visual adjustment |
+| `--interactive` | `-I` | `false` | Interactively prompt whether to open in Preview.app and confirm scope |
+| `--from-annotation` / `--detect-annotation` | | `false` | Extract target mask bounds directly from Preview.app markup annotation |
+| `--scope` | | `all` | Healing scope: `all` (all pages), `single` / `page` (anchor page only), `ask` |
+| `--stage-preview` | | `None` | Path to save staged PDF with target rectangle annotation and exit |
 | `--filter` / `--query` | `-f` / `-q` | `None` | Case-insensitive OCR text query/substring to detect via Apple Vision |
 | `--zone` | `-z` | `bottom-right` | Spatial search zone: `bottom-right`, `bottom-right-corner`, `logo`, `bottom-left`, `top-right`, `top-left`, `footer`, `header`, `all`, `custom` |
 | `--min-x`, `--max-x` | | `None` | Custom zone horizontal ratio range (`0.0` to `1.0`) |
@@ -290,13 +313,14 @@ info = inspect_anchor_page(
 print("Normalized Box:", info["normalizedBox"])
 print("Matched Text:", info["textMatched"])
 
-# 2. Heal across all slides
+# 2. Heal across all slides (or scope="single")
 success = process_with_native_engine(
     input_pdf="presentation.pdf",
     output_pdf="presentation_clean.pdf",
     anchor_page=1,
     text_filter="CONFIDENTIAL",
     mode="auto",
+    scope="all",
     padding=6,
     feather=4,
     dpi=300.0

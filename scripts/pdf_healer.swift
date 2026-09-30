@@ -24,6 +24,13 @@ struct BackgroundAnalysis: Codable {
     let planeParamsB: [Double]     // a, b, c
 }
 
+struct AnnotationItemInfo: Codable {
+    let type: String
+    let boundsPoints: [Double]     // [x, y, w, h] in PDF points
+    let normalizedBox: [Double]    // [x, y, w, h] normalized 0..1 (top-left origin)
+    let contents: String?
+}
+
 struct DetectedObjectInfo: Codable {
     let anchorPage: Int
     let textMatched: [String]
@@ -33,6 +40,8 @@ struct DetectedObjectInfo: Codable {
     let anchorPageWidth: Int
     let anchorPageHeight: Int
     let background: BackgroundAnalysis
+    let detectedFromAnnotation: Bool
+    let annotationType: String?
 }
 
 struct PDFRemoverOptions {
@@ -50,19 +59,24 @@ struct PDFRemoverOptions {
     var textFilter: String? = nil
     var explicitBox: CGRect? = nil
     var isExplicitNormalized: Bool = false
+    var fromAnnotation: Bool = false
     
     var healingMode: String = "auto" // "auto", "gradient", "solid", "inpaint"
     var pdfDPI: CGFloat = 300.0
     var pageRangeStr: String = "all"
     var excludePagesStr: String = ""
+    var scope: String = "all"        // "all", "single", "page"
     
     var padding: Int = 4
     var featherRadius: Int = 4
     var extendRight: Bool = false
     var extendBottom: Bool = false
     
+    var stagePreviewPath: String? = nil
     var previewMaskPath: String? = nil
     var inspectOnly: Bool = false
+    var listAnnotations: Bool = false
+    var stripAnnotations: Bool = true
     var jsonOutput: Bool = false
 }
 
@@ -74,40 +88,47 @@ func printUsage() {
     Usage: pdf_healer --input <input.pdf> --output <output.pdf> [options]
 
     Anchor Page & Object Targeting:
-      --anchor-page, -p <n>     Reference page to detect target object on (default: 1)
-      --filter, -f <query>      Text query or substring to detect via Apple Vision OCR
-      --zone, -z <name>         Spatial search zone preset:
-                                • bottom-right (default: right 35%, bottom 20%)
-                                • bottom-right-corner / logo (right 25%, bottom 12%)
-                                • bottom-left (left 35%, bottom 20%)
-                                • top-right (right 35%, top 20%)
-                                • top-left (left 35%, top 20%)
-                                • footer / bottom-bar (full width, bottom 12%)
-                                • header / top-bar (full width, top 12%)
-                                • all (entire page)
-                                • custom (use --min-x, --max-x, --min-y, --max-y)
-      --min-x, --max-x <0-1>    Custom zone horizontal ratio range (0.0 = left, 1.0 = right)
-      --min-y, --max-y <0-1>    Custom zone vertical ratio range (0.0 = top, 1.0 = bottom)
-      --box <b>                 Explicit box "x,y,w,h" (either 0.0..1.0 normalized or pixel coordinates)
-      --padding <px>            Margin expansion around detected object in pixels (default: 4)
-      --extend-right            Extend detected area flush to the right boundary of the page
-      --extend-bottom           Extend detected area flush to the bottom boundary of the page
+      --anchor-page, -p <n>       Reference page to detect target object on (default: 1)
+      --filter, -f <query>        Text query or substring to detect via Apple Vision OCR
+      --zone, -z <name>           Spatial search zone preset:
+                                  • bottom-right (default: right 35%, bottom 20%)
+                                  • bottom-right-corner / logo (right 25%, bottom 12%)
+                                  • bottom-left (left 35%, bottom 20%)
+                                  • top-right (right 35%, top 20%)
+                                  • top-left (left 35%, top 20%)
+                                  • footer / bottom-bar (full width, bottom 12%)
+                                  • header / top-bar (full width, top 12%)
+                                  • all (entire page)
+                                  • custom (use --min-x, --max-x, --min-y, --max-y)
+      --min-x, --max-x <0-1>      Custom zone horizontal ratio range (0.0 = left, 1.0 = right)
+      --min-y, --max-y <0-1>      Custom zone vertical ratio range (0.0 = top, 1.0 = bottom)
+      --box <b>                   Explicit box "x,y,w,h" (either 0.0..1.0 normalized or pixel coordinates)
+      --from-annotation           Extract target mask bounds directly from Preview.app PDF annotation
+      --list-annotations         Inspect and list all markup annotations on the anchor page
+      --padding <px>              Margin expansion around detected object in pixels (default: 4)
+      --extend-right              Extend detected area flush to the right boundary of the page
+      --extend-bottom             Extend detected area flush to the bottom boundary of the page
+
+    Interactive & Preview.app Staging:
+      --stage-preview <path.pdf>  Insert target rectangle annotation on anchor page and write staging PDF
+      --scope <all|single|page>   Apply healing to: all pages (default) or single anchor page only
+      --no-strip-annotations      Preserve markup annotations in output PDF (default: strip clean)
 
     Healing & Inpainting Modes:
-      --mode, -m <mode>         Healing strategy per page:
-                                • auto (default: detects gradient vs solid + grain synthesis)
-                                • gradient (2D planar surface detrending + noise synthesis)
-                                • solid (dominant perimeter border color)
-      --feather <px>            Edge feathering ramp width in pixels (default: 4)
+      --mode, -m <mode>           Healing strategy per page:
+                                  • auto (default: detects gradient vs solid + grain synthesis)
+                                  • gradient (2D planar surface detrending + noise synthesis)
+                                  • solid (dominant perimeter border color)
+      --feather <px>              Edge feathering ramp width in pixels (default: 4)
 
     PDF Processing & Inspection:
-      --dpi <number>            Rendering resolution for PDF rasterization (default: 300 DPI)
-      --pages <range>           Pages to apply healing across: "all" (default), "1-5", "2,4,6"
-      --exclude-pages <range>   Pages to exempt from healing
-      --preview-mask <path.png> Save high-res preview of anchor page with highlighted detection mask
-      --inspect                 Inspect anchor page, print detected coordinates and text, and exit
-      --json                    Output inspection and processing stats in structured JSON format
-      --help, -h                Show this help message
+      --dpi <number>              Rendering resolution for PDF rasterization (default: 300 DPI)
+      --pages <range>             Pages to apply healing across: "all" (default), "1-5", "2,4,6"
+      --exclude-pages <range>     Pages to exempt from healing
+      --preview-mask <path.png>   Save high-res preview of anchor page with highlighted detection mask
+      --inspect                   Inspect anchor page, print detected coordinates and text, and exit
+      --json                      Output inspection and processing stats in structured JSON format
+      --help, -h                  Show this help message
     """
     fputs(usage + "\n", stderr)
 }
@@ -173,6 +194,19 @@ func parseArgs() -> PDFRemoverOptions? {
                 }
                 i += 1
             }
+        case "--from-annotation", "--detect-annotation":
+            opts.fromAnnotation = true
+        case "--stage-preview", "--annotate-target":
+            if i + 1 < args.count { opts.stagePreviewPath = args[i+1]; i += 1 }
+        case "--scope":
+            if i + 1 < args.count { opts.scope = args[i+1].lowercased(); i += 1 }
+        case "--list-annotations":
+            opts.listAnnotations = true
+            opts.inspectOnly = true
+        case "--no-strip-annotations":
+            opts.stripAnnotations = false
+        case "--strip-annotations":
+            opts.stripAnnotations = true
         case "--mode", "-m":
             if i + 1 < args.count { opts.healingMode = args[i+1].lowercased(); i += 1 }
         case "--dpi":
@@ -208,7 +242,7 @@ func parseArgs() -> PDFRemoverOptions? {
         fputs("Error: Missing --input PDF path.\n", stderr)
         return nil
     }
-    if !opts.inspectOnly && opts.outputPath.isEmpty {
+    if !opts.inspectOnly && opts.stagePreviewPath == nil && opts.outputPath.isEmpty {
         fputs("Error: Missing --output PDF path.\n", stderr)
         return nil
     }
@@ -449,16 +483,73 @@ func analyzePerimeterBackground(
     )
 }
 
-// MARK: - Vision OCR & Spatial Object Detection on Anchor Page
+// MARK: - Vision OCR, Annotation & Spatial Object Detection on Anchor Page
+
+func extractAllAnnotations(from page: PDFPage) -> [AnnotationItemInfo] {
+    let mediaBox = page.bounds(for: .mediaBox)
+    var items: [AnnotationItemInfo] = []
+    
+    for a in page.annotations {
+        let b = a.bounds
+        let normX = Double((b.origin.x - mediaBox.origin.x) / mediaBox.width)
+        let normY = Double((mediaBox.height - (b.origin.y - mediaBox.origin.y + b.height)) / mediaBox.height)
+        let normW = Double(b.width / mediaBox.width)
+        let normH = Double(b.height / mediaBox.height)
+        
+        let info = AnnotationItemInfo(
+            type: a.type ?? "Annotation",
+            boundsPoints: [Double(b.origin.x), Double(b.origin.y), Double(b.width), Double(b.height)],
+            normalizedBox: [normX, normY, normW, normH],
+            contents: a.contents
+        )
+        items.append(info)
+    }
+    return items
+}
 
 func detectObjectOnAnchorPage(
+    anchorPage: PDFPage,
     anchorImage: CGImage,
     opts: PDFRemoverOptions
-) -> (CGRect, [String], BackgroundAnalysis) {
+) -> (CGRect, [String], BackgroundAnalysis, Bool, String?) {
     let imgW = CGFloat(anchorImage.width)
     let imgH = CGFloat(anchorImage.height)
+    let mediaBox = anchorPage.bounds(for: .mediaBox)
     
-    // 1. If explicit box was provided
+    // 1. If explicit annotation detection requested or annotations exist on anchor page
+    if opts.fromAnnotation || (opts.explicitBox == nil && opts.textFilter == nil && anchorPage.annotations.count > 0) {
+        let validTypes = ["Square", "Highlight", "Redact", "Circle", "Ink", "Polygon", "FreeText"]
+        let markupAnnotations = anchorPage.annotations.filter { annot in
+            guard let t = annot.type else { return false }
+            return validTypes.contains(where: { t.localizedCaseInsensitiveContains($0) })
+        }
+        
+        if let targetAnnot = markupAnnotations.last ?? anchorPage.annotations.last {
+            let b = targetAnnot.bounds
+            // Convert PDFKit bottom-left point coordinates to normalized top-left:
+            let normX = (b.origin.x - mediaBox.origin.x) / mediaBox.width
+            let normY = (mediaBox.height - (b.origin.y - mediaBox.origin.y + b.height)) / mediaBox.height
+            let normW = b.width / mediaBox.width
+            let normH = b.height / mediaBox.height
+            
+            let pad = CGFloat(opts.padding)
+            let pixelX = max(0, normX * imgW - pad)
+            let pixelY = max(0, normY * imgH - pad)
+            var pixelW = min(imgW - pixelX, normW * imgW + pad * 2)
+            var pixelH = min(imgH - pixelY, normH * imgH + pad * 2)
+            
+            if opts.extendRight { pixelW = imgW - pixelX }
+            if opts.extendBottom { pixelH = imgH - pixelY }
+            
+            let finalBox = CGRect(x: pixelX, y: pixelY, width: pixelW, height: pixelH)
+            let bg = analyzePerimeterBackground(cgImage: anchorImage, box: finalBox)
+            let annotName = targetAnnot.type ?? "Annotation"
+            let note = targetAnnot.contents ?? annotName
+            return (finalBox, [note], bg, true, annotName)
+        }
+    }
+    
+    // 2. If explicit box was provided
     if let explicit = opts.explicitBox {
         let box: CGRect
         if opts.isExplicitNormalized {
@@ -472,10 +563,10 @@ func detectObjectOnAnchorPage(
             box = explicit
         }
         let bg = analyzePerimeterBackground(cgImage: anchorImage, box: box)
-        return (box, ["<explicit-box>"], bg)
+        return (box, ["<explicit-box>"], bg, false, nil)
     }
     
-    // 2. Perform Apple Vision OCR text recognition
+    // 3. Perform Apple Vision OCR text recognition
     let request = VNRecognizeTextRequest()
     request.recognitionLevel = .accurate
     request.usesLanguageCorrection = false
@@ -485,7 +576,6 @@ func detectObjectOnAnchorPage(
     let observations = request.results ?? []
     
     // Define zone in pixel coordinates (Vision normalized coordinates have (0,0) at bottom-left)
-    // Convert options zone (where top is 0.0) to Vision coordinates (where bottom is 0.0)
     let zonePixelX = opts.zoneMinX * imgW
     let zonePixelY = opts.zoneMinY * imgH
     let zonePixelW = (opts.zoneMaxX - opts.zoneMinX) * imgW
@@ -555,7 +645,47 @@ func detectObjectOnAnchorPage(
     }
     
     let bg = analyzePerimeterBackground(cgImage: anchorImage, box: finalBox)
-    return (finalBox, matchedTexts, bg)
+    return (finalBox, matchedTexts, bg, false, nil)
+}
+
+// MARK: - Target Rectangle Annotation Staging for Preview.app
+
+func stagePreviewAnnotatedDocument(
+    inputURL: URL,
+    outputURL: URL,
+    anchorPageIdx: Int,
+    normalizedBox: [Double],
+    noteText: String = "Target Mask Area - Move/Resize in Preview.app"
+) -> Bool {
+    guard let doc = PDFDocument(url: inputURL) else { return false }
+    guard let page = doc.page(at: anchorPageIdx) else { return false }
+    
+    let mediaBox = page.bounds(for: .mediaBox)
+    let normX = normalizedBox[0]
+    let normY = normalizedBox[1]
+    let normW = normalizedBox[2]
+    let normH = normalizedBox[3]
+    
+    let ptX = mediaBox.origin.x + CGFloat(normX) * mediaBox.width
+    let ptY = mediaBox.origin.y + (1.0 - CGFloat(normY) - CGFloat(normH)) * mediaBox.height
+    let ptW = CGFloat(normW) * mediaBox.width
+    let ptH = CGFloat(normH) * mediaBox.height
+    let rectBounds = CGRect(x: ptX, y: ptY, width: ptW, height: ptH)
+    
+    let annotation = PDFAnnotation(bounds: rectBounds, forType: .square, withProperties: nil)
+    annotation.color = NSColor.systemRed
+    let border = PDFBorder()
+    border.lineWidth = 3.0
+    border.style = .solid
+    annotation.border = border
+    annotation.interiorColor = NSColor.systemRed.withAlphaComponent(0.20)
+    annotation.contents = noteText
+    
+    page.addAnnotation(annotation)
+    
+    let parentDir = outputURL.deletingLastPathComponent()
+    try? FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true)
+    return doc.write(to: outputURL)
 }
 
 // MARK: - High-Performance In-Memory Slide Healer
@@ -701,14 +831,22 @@ func savePreviewMask(
     
     ctx.draw(anchorImage, in: CGRect(x: 0, y: 0, width: width, height: height))
     
+    // In CGContext, origin is bottom-left, but box is in top-left pixel coordinates
+    let flippedBox = CGRect(
+        x: box.origin.x,
+        y: CGFloat(height) - box.origin.y - box.height,
+        width: box.width,
+        height: box.height
+    )
+    
     // Draw translucent red fill
     ctx.setFillColor(red: 1.0, green: 0.15, blue: 0.15, alpha: 0.40)
-    ctx.fill(box)
+    ctx.fill(flippedBox)
     
     // Draw bright green border
     ctx.setStrokeColor(red: 0.0, green: 1.0, blue: 0.25, alpha: 0.95)
     ctx.setLineWidth(4.0)
-    ctx.stroke(box)
+    ctx.stroke(flippedBox)
     
     if let outImage = ctx.makeImage() {
         let url = URL(fileURLWithPath: outPath) as CFURL
@@ -742,6 +880,25 @@ func main() {
         exit(1)
     }
     
+    // Annotation Inspection Mode
+    if opts.listAnnotations {
+        let items = extractAllAnnotations(from: anchorPage)
+        if opts.jsonOutput {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = .prettyPrinted
+            if let data = try? encoder.encode(items), let str = String(data: data, encoding: .utf8) {
+                print(str)
+            }
+        } else {
+            print("\n📋 Annotations on Anchor Page \(anchorIdx + 1) (\(items.count) item(s)):")
+            for (idx, it) in items.enumerated() {
+                print(String(format: "  [%d] Type: %@ | Norm: [%.4f, %.4f, %.4f, %.4f] | Contents: %@",
+                             idx + 1, it.type, it.normalizedBox[0], it.normalizedBox[1], it.normalizedBox[2], it.normalizedBox[3], it.contents ?? "N/A"))
+            }
+        }
+        return
+    }
+    
     if !opts.jsonOutput {
         print("📄 Document: '\(inputURL.lastPathComponent)' (\(totalPages) pages, target DPI: \(Int(opts.pdfDPI)))")
         print("🔍 Addressing target object on Anchor Page \(anchorIdx + 1)...")
@@ -755,7 +912,11 @@ func main() {
     }
     
     // 2. Detect object on Anchor Page
-    let (detectedBox, matchedTexts, anchorBG) = detectObjectOnAnchorPage(anchorImage: anchorImg, opts: opts)
+    let (detectedBox, matchedTexts, anchorBG, fromAnnot, annotType) = detectObjectOnAnchorPage(
+        anchorPage: anchorPage,
+        anchorImage: anchorImg,
+        opts: opts
+    )
     
     // Compute normalized coordinates (0.0 to 1.0)
     let normX = Double(detectedBox.origin.x / CGFloat(anchorW))
@@ -777,7 +938,9 @@ func main() {
         pointsBox: [ptX, ptY, ptW, ptH],
         anchorPageWidth: anchorW,
         anchorPageHeight: anchorH,
-        background: anchorBG
+        background: anchorBG,
+        detectedFromAnnotation: fromAnnot,
+        annotationType: annotType
     )
     
     // Diagnostic Preview Mask
@@ -785,6 +948,45 @@ func main() {
         savePreviewMask(anchorImage: anchorImg, box: detectedBox, outPath: previewPath)
         if !opts.jsonOutput {
             print("  📸 Saved diagnostic preview mask to: \(previewPath)")
+        }
+    }
+    
+    // Staging Preview Document for Preview.app
+    if let stagePath = opts.stagePreviewPath {
+        let stageURL = URL(fileURLWithPath: stagePath)
+        let note = matchedTexts.first ?? "Target Mask Area"
+        let ok = stagePreviewAnnotatedDocument(
+            inputURL: inputURL,
+            outputURL: stageURL,
+            anchorPageIdx: anchorIdx,
+            normalizedBox: [normX, normY, normW, normH],
+            noteText: note
+        )
+        if ok {
+            if opts.jsonOutput {
+                let res: [String: Any] = [
+                    "success": true,
+                    "stagePath": stagePath,
+                    "detection": [
+                        "anchorPage": anchorIdx + 1,
+                        "normalized": [normX, normY, normW, normH],
+                        "matchedText": matchedTexts,
+                        "anchorBG": anchorBG.hex
+                    ]
+                ]
+                if let data = try? JSONSerialization.data(withJSONObject: res, options: .prettyPrinted),
+                   let str = String(data: data, encoding: .utf8) {
+                    print(str)
+                }
+            } else {
+                print("  📱 Staged annotated Preview.app document to: \(stagePath)")
+            }
+            if opts.outputPath.isEmpty || opts.inspectOnly {
+                return
+            }
+        } else {
+            fputs("Error: Failed to stage annotated preview PDF to \(stagePath)\n", stderr)
+            exit(1)
         }
     }
     
@@ -800,8 +1002,11 @@ func main() {
             print("  • Normalized Box: [x: \(String(format: "%.4f", normX)), y: \(String(format: "%.4f", normY)), w: \(String(format: "%.4f", normW)), h: \(String(format: "%.4f", normH))]")
             print("  • Pixel Box (\(Int(opts.pdfDPI)) DPI): \(Int(detectedBox.origin.x)),\(Int(detectedBox.origin.y)) \(Int(detectedBox.width))x\(Int(detectedBox.height)) px")
             print("  • PDF Points (72 DPI): \(String(format: "%.1f,%.1f %.1fx%.1f pt", ptX, ptY, ptW, ptH))")
+            if fromAnnot {
+                print("  • Source: Preview.app Annotation (\(annotType ?? "Markup"))")
+            }
             if !matchedTexts.isEmpty {
-                print("  • Matched Text Items: \(matchedTexts.joined(separator: " | "))")
+                print("  • Matched Target: \(matchedTexts.joined(separator: " | "))")
             }
             print("  • Background: \(anchorBG.hex) (Gradient: \(anchorBG.isGradient), Noise Var: \(String(format: "%.2f", anchorBG.noiseVariance)))")
         }
@@ -809,12 +1014,22 @@ func main() {
     }
     
     // 3. Propagate and Heal Across Target Pages
-    let targetPageSet = parsePageSet(rangeStr: opts.pageRangeStr, totalPages: totalPages, defaultAll: true)
-    let excludeSet = parsePageSet(rangeStr: opts.excludePagesStr, totalPages: totalPages, defaultAll: false)
+    var targetPageSet: Set<Int>
+    if opts.scope == "single" || opts.scope == "page" || opts.scope == "current" {
+        targetPageSet = Set([anchorIdx])
+    } else {
+        targetPageSet = parsePageSet(rangeStr: opts.pageRangeStr, totalPages: totalPages, defaultAll: true)
+    }
     
+    let excludeSet = parsePageSet(rangeStr: opts.excludePagesStr, totalPages: totalPages, defaultAll: false)
     let activePages = targetPageSet.subtracting(excludeSet)
+    
     if !opts.jsonOutput {
-        print("🩹 Applying healing across \(activePages.count) slide page(s) at matching position...")
+        if opts.scope == "single" || opts.scope == "page" || opts.scope == "current" {
+            print("🩹 Applying healing to Anchor Page \(anchorIdx + 1) only...")
+        } else {
+            print("🩹 Applying healing across \(activePages.count) slide page(s) at matching position...")
+        }
     }
     
     let outDoc = PDFDocument()
@@ -826,6 +1041,12 @@ func main() {
         let pageMedia = page.bounds(for: .mediaBox)
         
         if !activePages.contains(pageIdx) {
+            // If preserving unhealed page, optionally strip markup annotations
+            if opts.stripAnnotations {
+                for a in page.annotations {
+                    page.removeAnnotation(a)
+                }
+            }
             outDoc.insert(page, at: outDoc.pageCount)
             continue
         }
@@ -868,6 +1089,11 @@ func main() {
         }
         
         // Fallback to original page if healing failed
+        if opts.stripAnnotations {
+            for a in page.annotations {
+                page.removeAnnotation(a)
+            }
+        }
         outDoc.insert(page, at: outDoc.pageCount)
     }
     
@@ -887,11 +1113,14 @@ func main() {
                 "output": opts.outputPath,
                 "totalPages": totalPages,
                 "healedPages": healedCount,
+                "scope": opts.scope,
                 "elapsedSeconds": elapsed,
                 "detection": [
                     "anchorPage": anchorIdx + 1,
                     "normalized": [normX, normY, normW, normH],
                     "matchedText": matchedTexts,
+                    "fromAnnotation": fromAnnot,
+                    "annotationType": annotType as Any,
                     "anchorBG": anchorBG.hex
                 ]
             ]

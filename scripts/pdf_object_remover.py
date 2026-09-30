@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """
-PDF-Object-Remover: Master CLI & Cross-Page Healing Suite
+PDF-Object-Remover: Master CLI & Cross-Page Healing Suite with Preview.app Integration
 Part of the pdf-object-remover skill on macOS.
 -------------------------------------------------------------------------------
 1. Identifies and addresses a target object on an Anchor Page:
    - Via Apple Vision OCR text query (--filter "CONFIDENTIAL")
    - Via spatial quadrant / zone (--zone bottom-right, footer, header, logo)
-   - Or via explicit coordinates (--box "x,y,w,h")
-2. Normalizes the target bounding box relative to page bounds.
-3. Automatically propagates that exact position across ALL slides/pages.
+   - Via explicit coordinates (--box "x,y,w,h")
+   - Or directly from Preview.app annotations/shapes (--from-annotation / --preview-app)
+2. Interactive Preview.app workflow:
+   - Inserts a visible, editable rectangle annotation on the detected spot in Preview.app.
+   - Allows moving, resizing, or drawing custom mask objects directly in Preview.app.
+   - Detects the adjusted annotation in Preview.app and uses it as the mask.
+3. Configurable scope:
+   - Apply healing across ALL pages at matching relative position (default).
+   - Or apply healing ONLY to that specific page (--scope single / --scope page).
 4. Executes page-adaptive healing on every page individually (matching each
    page's unique 2D gradient, grain noise, solid fill, or architectural grid).
 """
@@ -22,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -29,7 +36,6 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 NATIVE_HEALER_BIN = SCRIPT_DIR / "pdf_healer"
 BUILD_SCRIPT = SCRIPT_DIR / "build.sh"
 EXEMPLAR_SCRIPT = SCRIPT_DIR / "exemplar_healer.py"
-
 
 
 def ensure_native_binary() -> Path:
@@ -49,6 +55,7 @@ def inspect_anchor_page(
     zone: str = "bottom-right",
     text_filter: Optional[str] = None,
     explicit_box: Optional[str] = None,
+    from_annotation: bool = False,
     preview_mask_path: Optional[str] = None,
     dpi: float = 300.0,
     padding: int = 4,
@@ -73,6 +80,8 @@ def inspect_anchor_page(
         "--json",
     ]
 
+    if from_annotation:
+        cmd.append("--from-annotation")
     if text_filter:
         cmd.extend(["--filter", text_filter])
     if explicit_box:
@@ -102,6 +111,63 @@ def inspect_anchor_page(
         return {"raw_output": res.stdout.strip()}
 
 
+def stage_preview_document(
+    input_pdf: str,
+    stage_output_pdf: str,
+    anchor_page: int = 1,
+    zone: str = "bottom-right",
+    text_filter: Optional[str] = None,
+    explicit_box: Optional[str] = None,
+    dpi: float = 300.0,
+    padding: int = 4,
+    extend_right: bool = False,
+    extend_bottom: bool = False,
+    min_x: Optional[float] = None,
+    max_x: Optional[float] = None,
+    min_y: Optional[float] = None,
+    max_y: Optional[float] = None,
+) -> bool:
+    """Inserts a target rectangle annotation on the anchor page and saves a staging PDF."""
+    healer_bin = ensure_native_binary()
+
+    cmd = [
+        str(healer_bin),
+        "--input", os.path.abspath(input_pdf),
+        "--stage-preview", os.path.abspath(stage_output_pdf),
+        "--anchor-page", str(anchor_page),
+        "--zone", zone,
+        "--dpi", str(dpi),
+        "--padding", str(padding),
+    ]
+
+    if text_filter:
+        cmd.extend(["--filter", text_filter])
+    if explicit_box:
+        cmd.extend(["--box", explicit_box])
+    if extend_right:
+        cmd.append("--extend-right")
+    if extend_bottom:
+        cmd.append("--extend-bottom")
+    if min_x is not None:
+        cmd.extend(["--min-x", str(min_x)])
+    if max_x is not None:
+        cmd.extend(["--max-x", str(max_x)])
+    if min_y is not None:
+        cmd.extend(["--min-y", str(min_y)])
+    if max_y is not None:
+        cmd.extend(["--max-y", str(max_y)])
+
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    return res.returncode == 0
+
+
+def open_in_preview_app(pdf_path: str):
+    """Opens a PDF in macOS Preview.app and brings Preview to the foreground."""
+    subprocess.run(["open", "-a", "Preview", os.path.abspath(pdf_path)])
+    # Activate Preview
+    subprocess.run(["osascript", "-e", 'tell application "Preview" to activate'], capture_output=True)
+
+
 def process_with_native_engine(
     input_pdf: str,
     output_pdf: str,
@@ -109,10 +175,12 @@ def process_with_native_engine(
     zone: str = "bottom-right",
     text_filter: Optional[str] = None,
     explicit_box: Optional[str] = None,
+    from_annotation: bool = False,
     mode: str = "auto",
     dpi: float = 300.0,
     pages: str = "all",
     exclude_pages: str = "",
+    scope: str = "all",
     padding: int = 4,
     feather: int = 4,
     extend_right: bool = False,
@@ -136,10 +204,13 @@ def process_with_native_engine(
         "--mode", mode,
         "--dpi", str(dpi),
         "--pages", pages,
+        "--scope", scope,
         "--padding", str(padding),
         "--feather", str(feather),
     ]
 
+    if from_annotation:
+        cmd.append("--from-annotation")
     if text_filter:
         cmd.extend(["--filter", text_filter])
     if explicit_box:
@@ -174,10 +245,12 @@ def process_with_exemplar_engine(
     zone: str = "bottom-right",
     text_filter: Optional[str] = None,
     explicit_box: Optional[str] = None,
+    from_annotation: bool = False,
     strategy: str = "composite",
     dpi: float = 300.0,
     pages: str = "all",
     exclude_pages: str = "",
+    scope: str = "all",
     padding: int = 4,
     seam_width: int = 6,
     extend_right: bool = False,
@@ -208,6 +281,7 @@ def process_with_exemplar_engine(
         zone=zone,
         text_filter=text_filter,
         explicit_box=explicit_box,
+        from_annotation=from_annotation,
         preview_mask_path=preview_mask_path,
         dpi=dpi,
         padding=padding,
@@ -223,7 +297,7 @@ def process_with_exemplar_engine(
     matched_texts = inspect_res.get("textMatched", [])
     print(f"  [✓] Anchor Box: {norm_x:.4f}, {norm_y:.4f} ({norm_w:.4f} x {norm_h:.4f})")
     if matched_texts:
-        print(f"  [✓] Target Text: {' | '.join(matched_texts)}")
+        print(f"  [✓] Target Text / Shape: {' | '.join(matched_texts)}")
 
     # Import exemplar healer functions
     sys.path.insert(0, str(SCRIPT_DIR))
@@ -234,8 +308,10 @@ def process_with_exemplar_engine(
         total_pages = len(doc)
         print(f"📄 Processing {total_pages} page(s) via PyMuPDF + Exemplar/Neural Engine ({strategy.upper()})...")
 
-        # Parse target pages
-        if pages.lower() == "all":
+        # Parse target pages according to scope
+        if scope in ["single", "page", "current"]:
+            target_set = {anchor_page - 1}
+        elif pages.lower() == "all":
             target_set = set(range(total_pages))
         else:
             target_set = set()
@@ -278,7 +354,6 @@ def process_with_exemplar_engine(
         out_doc = fitz.open()
         for p_path in page_images:
             img_doc = fitz.open(p_path)
-            rect = img_doc[0].rect
             pdf_bytes = img_doc.convert_to_pdf()
             img_pdf = fitz.open("pdf", pdf_bytes)
             out_doc.insert_pdf(img_pdf)
@@ -300,10 +375,12 @@ def process_with_exemplar_engine(
             zone=zone,
             text_filter=text_filter,
             explicit_box=explicit_box,
+            from_annotation=from_annotation,
             mode="auto",
             dpi=dpi,
             pages=pages,
             exclude_pages=exclude_pages,
+            scope=scope,
             padding=padding,
             extend_right=extend_right,
             extend_bottom=extend_bottom,
@@ -311,9 +388,201 @@ def process_with_exemplar_engine(
         )
 
 
+def run_preview_interactive_flow(
+    input_pdf: str,
+    output_pdf: str,
+    anchor_page: int = 1,
+    zone: str = "bottom-right",
+    text_filter: Optional[str] = None,
+    explicit_box: Optional[str] = None,
+    mode: str = "auto",
+    dpi: float = 300.0,
+    pages: str = "all",
+    exclude_pages: str = "",
+    scope: str = "all",
+    padding: int = 4,
+    feather: int = 4,
+    extend_right: bool = False,
+    extend_bottom: bool = False,
+    preview_mask_path: Optional[str] = None,
+    min_x: Optional[float] = None,
+    max_x: Optional[float] = None,
+    min_y: Optional[float] = None,
+    max_y: Optional[float] = None,
+) -> bool:
+    """
+    Executes the interactive Preview.app flow:
+    1. Detects target spot on Anchor Page.
+    2. Stages a temporary PDF with an editable rectangle annotation placed over the spot.
+    3. Opens the staging document in Preview.app.
+    4. Waits for the user to adjust or draw shapes in Preview.app and save (Cmd+S).
+    5. Detects the updated annotation bounds from Preview.app.
+    6. Prompts for scope (all pages vs only anchor page) if not preset.
+    7. Heals the PDF and saves clean output.
+    """
+    print(f"\n🔍 Step 1: Detecting target spot on Anchor Page {anchor_page}...")
+    initial_res = inspect_anchor_page(
+        input_pdf=input_pdf,
+        anchor_page=anchor_page,
+        zone=zone,
+        text_filter=text_filter,
+        explicit_box=explicit_box,
+        dpi=dpi,
+        padding=padding,
+        extend_right=extend_right,
+        extend_bottom=extend_bottom,
+        min_x=min_x,
+        max_x=max_x,
+        min_y=min_y,
+        max_y=max_y,
+    )
+
+    norm = initial_res.get("normalizedBox", [0.75, 0.85, 0.20, 0.10])
+    text_items = initial_res.get("textMatched", [])
+    print(f"  • Initial Detected Box: [x: {norm[0]:.4f}, y: {norm[1]:.4f}, w: {norm[2]:.4f}, h: {norm[3]:.4f}]")
+    if text_items:
+        print(f"  • Matched Target: {' | '.join(text_items)}")
+
+    # Create staging document
+    temp_dir = tempfile.mkdtemp(prefix="pdf_remover_preview_")
+    staging_pdf = os.path.join(temp_dir, f"staged_page{anchor_page}.pdf")
+
+    print(f"\n📱 Step 2: Creating staged preview document with interactive rectangle...")
+    staged_ok = stage_preview_document(
+        input_pdf=input_pdf,
+        stage_output_pdf=staging_pdf,
+        anchor_page=anchor_page,
+        zone=zone,
+        text_filter=text_filter,
+        explicit_box=explicit_box,
+        dpi=dpi,
+        padding=padding,
+        extend_right=extend_right,
+        extend_bottom=extend_bottom,
+        min_x=min_x,
+        max_x=max_x,
+        min_y=min_y,
+        max_y=max_y,
+    )
+
+    if not staged_ok or not os.path.exists(staging_pdf):
+        print("Error: Could not create staged document for Preview.app.", file=sys.stderr)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return False
+
+    print(f"🚀 Step 3: Opening document in Preview.app...")
+    open_in_preview_app(staging_pdf)
+
+    print("\n" + "=" * 70)
+    print("✏️  PREVIEW.APP INTERACTIVE MASKING INSTRUCTIONS:")
+    print("   1. Preview.app has opened with a RED RECTANGLE sitting on the detected spot.")
+    print("   2. You can click and drag the blue handles to MOVE or RESIZE the rectangle.")
+    print("   3. Or draw your own rectangle/shape using Preview's Markup Toolbar (Cmd+Shift+A).")
+    print("   4. When satisfied with the mask area, press Cmd+S to SAVE in Preview.app.")
+    print("=" * 70)
+
+    # Prompt user in terminal
+    try:
+        user_input = input("\n👉 Press [ENTER] after saving in Preview.app (or type 'q' to abort): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        user_input = "q"
+
+    if user_input.lower() == "q":
+        print("\n❌ Operation cancelled by user.")
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return False
+
+    print("\n🎯 Step 4: Detecting adjusted masking object from Preview.app...")
+    updated_res = inspect_anchor_page(
+        input_pdf=staging_pdf,
+        anchor_page=anchor_page,
+        from_annotation=True,
+        dpi=dpi,
+        padding=padding,
+        extend_right=extend_right,
+        extend_bottom=extend_bottom,
+    )
+
+    updated_norm = updated_res.get("normalizedBox", norm)
+    updated_pix = updated_res.get("pixelBox", [0, 0, 0, 0])
+    annot_type = updated_res.get("annotationType", "Markup")
+    detected_from_annot = updated_res.get("detectedFromAnnotation", False)
+
+    print(f"  [✓] Mask Area: [x: {updated_norm[0]:.4f}, y: {updated_norm[1]:.4f}, w: {updated_norm[2]:.4f}, h: {updated_norm[3]:.4f}]")
+    print(f"  [✓] Pixel Box ({int(dpi)} DPI): {int(updated_pix[0])},{int(updated_pix[1])} {int(updated_pix[2])}x{int(updated_pix[3])} px")
+    if detected_from_annot:
+        print(f"  [✓] Successfully extracted {annot_type} object from Preview.app!")
+
+    # Format explicit box string for processing
+    explicit_box_str = f"{updated_norm[0]:.6f},{updated_norm[1]:.6f},{updated_norm[2]:.6f},{updated_norm[3]:.6f}"
+
+    # Prompt for scope if scope was not explicitly provided on CLI
+    chosen_scope = scope
+    if scope == "ask" or (sys.stdin.isatty() and scope == "all"):
+        print("\n❓ Step 5: Choose Healing Scope:")
+        print("   [1] All pages across the document at this matching relative position (Default)")
+        print(f"   [2] Only this page (Anchor Page {anchor_page} only)")
+        print("   [3] Custom page range (e.g. 1-5)")
+        try:
+            scope_choice = input("👉 Select scope [1/2/3] (default: 1): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            scope_choice = "1"
+
+        if scope_choice == "2":
+            chosen_scope = "single"
+        elif scope_choice == "3":
+            custom_range = input("Enter page range (e.g. 1-5, 2,4,6): ").strip()
+            if custom_range:
+                pages = custom_range
+            chosen_scope = "all"
+        else:
+            chosen_scope = "all"
+
+    print(f"\n🩹 Step 6: Executing healing (Scope: {chosen_scope.upper()})...")
+    if mode in ["exemplar", "lama", "composite"]:
+        success = process_with_exemplar_engine(
+            input_pdf=input_pdf,
+            output_pdf=output_pdf,
+            anchor_page=anchor_page,
+            explicit_box=explicit_box_str,
+            from_annotation=False,
+            strategy=mode,
+            dpi=dpi,
+            pages=pages,
+            exclude_pages=exclude_pages,
+            scope=chosen_scope,
+            padding=padding,
+            seam_width=feather,
+            extend_right=extend_right,
+            extend_bottom=extend_bottom,
+            preview_mask_path=preview_mask_path,
+        )
+    else:
+        success = process_with_native_engine(
+            input_pdf=input_pdf,
+            output_pdf=output_pdf,
+            anchor_page=anchor_page,
+            explicit_box=explicit_box_str,
+            from_annotation=False,
+            mode=mode,
+            dpi=dpi,
+            pages=pages,
+            exclude_pages=exclude_pages,
+            scope=chosen_scope,
+            padding=padding,
+            feather=feather,
+            extend_right=extend_right,
+            extend_bottom=extend_bottom,
+            preview_mask_path=preview_mask_path,
+        )
+
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    return success
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="PDF-Object-Remover: Detect on Anchor Page and Heal Across All Slides/Pages on macOS."
+        description="PDF-Object-Remover: Detect on Anchor Page and Heal Across All Slides/Pages on macOS with Preview.app Integration."
     )
     parser.add_argument("--input", "-i", required=True, help="Input PDF document path")
     parser.add_argument("--output", "-o", help="Output cleaned PDF document path")
@@ -333,6 +602,34 @@ def main():
     parser.add_argument("--min-y", type=float, help="Custom zone min Y ratio (0.0 to 1.0)")
     parser.add_argument("--max-y", type=float, help="Custom zone max Y ratio (0.0 to 1.0)")
     parser.add_argument("--box", "-b", help="Explicit box coordinates: 'x,y,w,h' (normalized 0..1 or pixels)")
+
+    # Preview.app & Interactive Mode Options
+    parser.add_argument(
+        "--preview-app", "--open-preview", "-P",
+        action="store_true",
+        help="Open document in Preview.app with the target area highlighted by a rectangle annotation"
+    )
+    parser.add_argument(
+        "--interactive", "-I",
+        action="store_true",
+        help="Interactively ask whether to open Preview.app and verify masking before healing"
+    )
+    parser.add_argument(
+        "--from-annotation", "--detect-annotation",
+        action="store_true",
+        help="Extract target mask bounds directly from Preview.app markup annotation"
+    )
+    parser.add_argument(
+        "--stage-preview",
+        help="Save staging PDF with highlighted target rectangle for Preview.app and exit"
+    )
+    parser.add_argument(
+        "--scope",
+        default="all",
+        choices=["all", "single", "page", "current", "ask"],
+        help="Healing scope: 'all' pages (default), 'single' / 'page' (anchor page only), or 'ask'"
+    )
+
     parser.add_argument(
         "--mode", "-m",
         default="auto",
@@ -352,6 +649,32 @@ def main():
 
     args = parser.parse_args()
 
+    # Stage preview only
+    if args.stage_preview:
+        ok = stage_preview_document(
+            input_pdf=args.input,
+            stage_output_pdf=args.stage_preview,
+            anchor_page=args.anchor_page,
+            zone=args.zone,
+            text_filter=args.filter,
+            explicit_box=args.box,
+            dpi=args.dpi,
+            padding=args.padding,
+            extend_right=args.extend_right,
+            extend_bottom=args.extend_bottom,
+            min_x=args.min_x,
+            max_x=args.max_x,
+            min_y=args.min_y,
+            max_y=args.max_y,
+        )
+        if ok:
+            print(f"✅ Staged preview PDF with target rectangle saved to: {args.stage_preview}")
+        else:
+            print(f"Error: Failed to create staged preview PDF at {args.stage_preview}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # Inspect only
     if args.inspect:
         res = inspect_anchor_page(
             input_pdf=args.input,
@@ -359,6 +682,7 @@ def main():
             zone=args.zone,
             text_filter=args.filter,
             explicit_box=args.box,
+            from_annotation=args.from_annotation,
             preview_mask_path=args.preview_mask,
             dpi=args.dpi,
             padding=args.padding,
@@ -375,9 +699,14 @@ def main():
             norm = res.get("normalizedBox", [0, 0, 0, 0])
             pix = res.get("pixelBox", [0, 0, 0, 0])
             bg = res.get("background", {})
+            annot_type = res.get("annotationType")
+            from_annot = res.get("detectedFromAnnotation", False)
+
             print(f"\n🎯 Anchor Page {args.anchor_page} Object Detection Summary:")
             print(f"  • Normalized Area: [x: {norm[0]:.4f}, y: {norm[1]:.4f}, w: {norm[2]:.4f}, h: {norm[3]:.4f}]")
             print(f"  • Pixel Area ({int(args.dpi)} DPI): {int(pix[0])},{int(pix[1])} {int(pix[2])}x{int(pix[3])} px")
+            if from_annot:
+                print(f"  • Source: Preview.app Annotation ({annot_type or 'Markup'})")
             if res.get("textMatched"):
                 print(f"  • Matched Text: {' | '.join(res['textMatched'])}")
             print(f"  • Background: {bg.get('hex', 'N/A')} (Gradient: {bg.get('isGradient', False)})")
@@ -386,9 +715,48 @@ def main():
         return
 
     if not args.output:
-        print("Error: --output PDF path is required (unless using --inspect).", file=sys.stderr)
+        print("Error: --output PDF path is required (unless using --inspect or --stage-preview).", file=sys.stderr)
         sys.exit(1)
 
+    # Check for Interactive / Preview.app flow
+    should_open_preview = args.preview_app
+    if args.interactive and not args.preview_app:
+        # Prompt user whether to open in Preview.app
+        try:
+            ans = input(f"❓ Would you like to open '{Path(args.input).name}' in Preview.app to visually adjust the target rectangle? [y/N]: ").strip().lower()
+            if ans in ["y", "yes"]:
+                should_open_preview = True
+        except (EOFError, KeyboardInterrupt):
+            should_open_preview = False
+
+    if should_open_preview:
+        success = run_preview_interactive_flow(
+            input_pdf=args.input,
+            output_pdf=args.output,
+            anchor_page=args.anchor_page,
+            zone=args.zone,
+            text_filter=args.filter,
+            explicit_box=args.box,
+            mode=args.mode,
+            dpi=args.dpi,
+            pages=args.pages,
+            exclude_pages=args.exclude_pages,
+            scope=args.scope,
+            padding=args.padding,
+            feather=args.feather,
+            extend_right=args.extend_right,
+            extend_bottom=args.extend_bottom,
+            preview_mask_path=args.preview_mask,
+            min_x=args.min_x,
+            max_x=args.max_x,
+            min_y=args.min_y,
+            max_y=args.max_y,
+        )
+        if not success:
+            sys.exit(1)
+        return
+
+    # Direct Processing Flow
     if args.mode in ["exemplar", "lama", "composite"]:
         success = process_with_exemplar_engine(
             input_pdf=args.input,
@@ -397,10 +765,12 @@ def main():
             zone=args.zone,
             text_filter=args.filter,
             explicit_box=args.box,
+            from_annotation=args.from_annotation,
             strategy=args.mode,
             dpi=args.dpi,
             pages=args.pages,
             exclude_pages=args.exclude_pages,
+            scope=args.scope,
             padding=args.padding,
             seam_width=args.feather,
             extend_right=args.extend_right,
@@ -415,10 +785,12 @@ def main():
             zone=args.zone,
             text_filter=args.filter,
             explicit_box=args.box,
+            from_annotation=args.from_annotation,
             mode=args.mode,
             dpi=args.dpi,
             pages=args.pages,
             exclude_pages=args.exclude_pages,
+            scope=args.scope,
             padding=args.padding,
             feather=args.feather,
             extend_right=args.extend_right,
